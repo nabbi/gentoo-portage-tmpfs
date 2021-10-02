@@ -1,0 +1,157 @@
+#!/sbin/openrc-run
+# nic@boet.cc
+# init script to populate tmpfs mounted portage repo
+#
+
+extra_stopped_commands="setup remove"
+
+portage="/var/db/repos"
+tar=/var/db/repos-snapshot.tar.gz
+
+depend() {
+        need local
+        before nfs
+}
+
+snapshot() {
+    
+    if [ -f ${tar} ]; then
+        if test `find ${tar} -mmin -1440` ; then
+            einfo "   skipping snapshot creation, recent archive exists"
+            return 0
+        fi
+    fi
+
+    if [ -f ${portage}/tmpfs-not-mounted ] ; then
+        eerror "   refusing to create snapshot, ${portage}/tmpfs-not-mounted exists"
+        return 1
+    fi
+
+
+	einfo "   creating portage snapshot"
+	tar -czp --absolute-names ${portage} -f ${tar} > /dev/null 2>&1 || return 1
+    
+    return 0
+}
+
+restore(){
+    
+    einfo "   restoring ${tar} to ${portage}"
+	tar -xzf ${tar} ${portage}  -C / > /dev/null  2>&1 || return 1
+	
+	return 0
+
+}
+
+setup() {
+    ebegin "Deploying ${SVCNAME}"
+
+    if grep "${portage}" /etc/fstab > /dev/null; then
+        ewarn "   already setup, ${portage} defined in /etc/fstab"
+        return 1
+    fi
+    
+    if [ -f ${portage}/tmpfs-not-mounted ] ; then
+        ewarn "   already setup, ${portage}/tmpfs-not-mounted exists"
+        return 1
+    fi
+
+    if mountpoint ${portage} > /dev/null; then
+        eerror "   mountpoint already exists at ${portage}"
+        return 1
+    fi
+        
+
+    if [ ! -f ${portage}/gentoo/metadata/timestamp ] ; then
+        eerror "   existing gentoo repo not found under ${portage}"
+        return 1
+    fi
+
+    snapshot || return 1
+	
+	einfo "   purging ${portage}"	
+	rm -r ${portage} || return 1
+    mkdir ${portage} || return 1
+
+    einfo "   creating mountpoint"
+    touch $portage/tmpfs-not-mounted || return 1
+    echo "none  /var/db/repos/  tmpfs   defaults,size=2G    0 0  ## ${SVCNAME} ##" >> /etc/fstab || return 1
+
+	einfo "setup complete, please start service"
+
+    eend $?
+}
+
+remove() {
+    ebegin "Removing ${SVCNAME}"
+
+    if mountpoint ${portage} > /dev/null; then
+        umount -fl ${portage} > /dev/null || return 1
+        
+        if mountpoint ${portage} > /dev/null ; then
+            eerror "   env not stable, ${portage} still mounted"
+            return 1
+        fi
+    fi
+
+    if [ -f ${portage}/tmpfs-not-mounted ] ; then
+        rm ${portage}/tmpfs-not-mounted || return 1
+    fi
+
+    if grep "${portage}" /etc/fstab > /dev/null; then
+        sed -i "/## ${SVCNAME} ##/d" /etc/fstab || return 1
+    fi
+
+	einfo "   purging ${portage}"	
+    rm -r ${portage} || return 1
+    mkdir ${portage} || return 1
+
+    restore || return 1
+    
+    if [ -f ${tar} ] ; then
+        rm $tar || return 1
+    fi
+    
+    einfo "complete"
+    eend $?
+}
+
+start() {
+
+    ebegin "Starting ${SVCNAME}"
+    if mountpoint ${portage} > /dev/null ; then
+        ewarn "   unmounting ${portage}"
+        umount -fl ${portage} > /dev/null || eerror "   failed"
+    fi
+
+    if [ ! -f ${portage}/tmpfs-not-mounted ] ; then
+        eerror "   please run setup first"
+        return 1
+    fi
+    
+    mount ${portage} > /dev/null || eerror "   failed to mount ${portage}"
+
+    if [ ! -f ${portage}/gentoo/metadata/timestamp ] ; then
+        restore || eerror "   failed to restore ${tar}"
+    fi
+
+    eend $?
+}
+
+stop() {
+    
+    ebegin "Stopping ${SVCNAME}"
+  
+    if mountpoint ${portage} > /dev/null ; then
+        if [ -f ${portage}/gentoo/metadata/timestamp ] ; then
+            snapshot || eerror "   failed to archive current tmpfs contents"
+        fi
+        umount -fl ${portage} > /dev/null || ewarn "   failed to umount tmpfs"
+
+    else
+        ewarn "   openrc-run started state, ${portage} not mounted"
+    fi
+
+    eend $?
+}
+
