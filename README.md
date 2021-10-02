@@ -1,5 +1,5 @@
-# Gento Portage TmpFS
-If you are hosting a busy portage rsync or nfs server, and have 2GB of free memory, this initd script migrates portage into fast tmpfs which persists server reboots
+# Gentoo Portage ebuild tmpfs
+If you are hosting a busy portage rsync or nfs server, and have 2GB free non-swappable memory, this initd script migrates portage into fast tmpfs which persists server reboots.
 
 ## setup
 copy into /etc/init.d/ and run setup and start
