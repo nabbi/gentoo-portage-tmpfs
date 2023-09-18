@@ -10,7 +10,6 @@ portage="/var/db/repos"
 tar=/var/db/repos-snapshot.tar.gz
 
 depend() {
-    need local
     before nfs
 }
 
