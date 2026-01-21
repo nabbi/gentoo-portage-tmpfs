@@ -1,40 +1,160 @@
 #!/sbin/openrc-run
 # nic@boet.cc
-# init script to populate tmpfs mounted portage repo
-#
+# Populate a tmpfs-mounted Portage repo tree at /var/db/repos from a snapshot tarball.
+# Provides commands: setup remove snapshot (plus normal start/stop).
 
 extra_started_commands="snapshot"
 extra_stopped_commands="setup remove"
 
-portage="/var/db/repos"
-tar=/var/db/repos-snapshot.tar.gz
+PORTAGE_ROOT="/var/db/repos"
+TARBALL="/var/db/repos-snapshot.tar.gz"
+SENTINEL="${PORTAGE_ROOT}/tmpfs-not-mounted"
+
+# Marker used to find/remove the exact fstab line this service owns
+FSTAB_MARK="## ${SVCNAME} ##"
 
 depend() {
     before nfs
 }
 
-snapshot() {
-    if [ -f ${tar} ]; then
-        if test `find ${tar} -mmin -1440` ; then
-            einfo "   skipping snapshot creation, recent archive exists"
-            return 0
-        fi
+# -------- helpers --------
+
+die() {
+    eerror "   $*"
+    return 1
+}
+
+have_cmd() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+is_mounted() {
+    # Prefer mountpoint(1); otherwise fall back to /proc/mounts
+    if have_cmd mountpoint; then
+        mountpoint -q -- "$1"
+        return $?
     fi
 
-    if [ -f ${portage}/tmpfs-not-mounted ] ; then
-        eerror "   refusing to create snapshot, ${portage}/tmpfs-not-mounted exists"
+    # POSIX-ish fallback
+    # shellcheck disable=SC2002
+    awk -v mp="$1" '$2 == mp { found=1 } END { exit(found ? 0 : 1) }' /proc/mounts 2>/dev/null
+}
+
+has_gentoo_repo_marker() {
+    [ -f "${PORTAGE_ROOT}/gentoo/metadata/timestamp" ]
+}
+
+safe_purge_dir() {
+    # Remove and recreate a directory safely.
+    # Refuse to operate on empty, root, or non-absolute paths.
+    _d="$1"
+
+    case "${_d}" in
+        ""|"/")
+            die "refusing to purge unsafe path '${_d}'"
+            return 1
+            ;;
+        /*)
+            ;;
+        *)
+            die "refusing to purge non-absolute path '${_d}'"
+            return 1
+            ;;
+    esac
+
+    if [ -L "${_d}" ]; then
+        die "refusing to purge symlink '${_d}'"
         return 1
     fi
 
-    einfo "   creating portage snapshot"
-    tar -czp --absolute-names ${portage} -f ${tar} > /dev/null 2>&1 || return 1
-    
+    rm -rf -- "${_d}" || return 1
+    mkdir -p -- "${_d}" || return 1
     return 0
 }
 
-restore(){
-    einfo "   restoring ${tar} to ${portage}"
-    tar -xzf ${tar} ${portage} -C / > /dev/null  2>&1 || return 1
+fstab_has_our_entry() {
+    # Only treat lines containing our marker as "owned"
+    grep -F -- "${FSTAB_MARK}" /etc/fstab >/dev/null 2>&1
+}
+
+fstab_add_entry() {
+    # Add a single tmpfs mount entry for PORTAGE_ROOT, with our marker.
+    # Use a predictable format, avoid duplicate entries.
+    if fstab_has_our_entry; then
+        ewarn "   fstab already contains entry for ${SVCNAME}"
+        return 0
+    fi
+
+    echo "none  ${PORTAGE_ROOT}  tmpfs  defaults,size=2G  0  0  ${FSTAB_MARK}" >> /etc/fstab || return 1
+    return 0
+}
+
+fstab_remove_entry() {
+    if ! fstab_has_our_entry; then
+        return 0
+    fi
+
+    # Delete only lines containing our marker
+    sed -i "\|${FSTAB_MARK}|d" /etc/fstab || return 1
+    return 0
+}
+
+tarball_is_recent() {
+    # True if tarball modified within last 1440 minutes (24h)
+    [ -f "${TARBALL}" ] || return 1
+
+    # Use find -print -quit and check for any output
+    if find "${TARBALL}" -mmin -1440 -print -quit 2>/dev/null | grep -q .; then
+        return 0
+    fi
+
+    return 1
+}
+
+# -------- commands --------
+
+snapshot() {
+    if tarball_is_recent; then
+        einfo "   skipping snapshot creation, recent archive exists"
+        return 0
+    fi
+
+    if [ -f "${SENTINEL}" ]; then
+        die "refusing to create snapshot, sentinel exists: ${SENTINEL}"
+        return 1
+    fi
+
+    if [ ! -d "${PORTAGE_ROOT}" ]; then
+        die "portage root does not exist: ${PORTAGE_ROOT}"
+        return 1
+    fi
+
+    einfo "   creating portage snapshot at ${TARBALL}"
+
+    # Archive the whole PORTAGE_ROOT tree using absolute paths.
+    # -c create, -z gzip, -p preserve perms, -f file
+    # Use --absolute-names so the archive stores leading /
+    if ! tar -czpf "${TARBALL}" --absolute-names "${PORTAGE_ROOT}" >/dev/null 2>&1; then
+        die "snapshot failed (tar returned non-zero)"
+        return 1
+    fi
+
+    return 0
+}
+
+restore() {
+    if [ ! -f "${TARBALL}" ]; then
+        die "snapshot tarball missing: ${TARBALL}"
+        return 1
+    fi
+
+    einfo "   restoring ${TARBALL} to /"
+
+    # Extract using -C / and --absolute-names to honor absolute paths.
+    if ! tar -xzpf "${TARBALL}" -C / --absolute-names >/dev/null 2>&1; then
+        die "restore failed (tar returned non-zero)"
+        return 1
+    fi
 
     return 0
 }
@@ -42,108 +162,136 @@ restore(){
 setup() {
     ebegin "Deploying ${SVCNAME}"
 
-    if grep "${portage}" /etc/fstab > /dev/null; then
-        ewarn "   already setup, ${portage} defined in /etc/fstab"
+    if fstab_has_our_entry; then
+        ewarn "   already setup: fstab entry exists for ${SVCNAME}"
+        eend 0
+        return 0
+    fi
+
+    if [ -f "${SENTINEL}" ]; then
+        ewarn "   already setup: sentinel exists: ${SENTINEL}"
+        eend 0
+        return 0
+    fi
+
+    if is_mounted "${PORTAGE_ROOT}"; then
+        die "mountpoint already mounted at ${PORTAGE_ROOT} (refusing to modify)"
+        eend 1
         return 1
     fi
 
-    if [ -f ${portage}/tmpfs-not-mounted ] ; then
-        ewarn "   already setup, ${portage}/tmpfs-not-mounted exists"
+    if ! has_gentoo_repo_marker; then
+        die "existing gentoo repo not found under ${PORTAGE_ROOT} (missing metadata/timestamp)"
+        eend 1
         return 1
     fi
 
-    if mountpoint ${portage} > /dev/null; then
-        eerror "   mountpoint already exists at ${portage}"
-        return 1
-    fi
+    snapshot || { eend 1; return 1; }
 
-    if [ ! -f ${portage}/gentoo/metadata/timestamp ] ; then
-        eerror "   existing gentoo repo not found under ${portage}"
-        return 1
-    fi
+    einfo "   purging ${PORTAGE_ROOT}"
+    safe_purge_dir "${PORTAGE_ROOT}" || { eend 1; return 1; }
 
-    snapshot || return 1
+    einfo "   creating sentinel ${SENTINEL}"
+    touch -- "${SENTINEL}" || { eend 1; return 1; }
 
-    einfo "   purging ${portage}"
-    rm -r ${portage} || return 1
-    mkdir ${portage} || return 1
-
-    einfo "   creating mountpoint"
-    touch $portage/tmpfs-not-mounted || return 1
-    echo "none  /var/db/repos/  tmpfs   defaults,size=2G    0 0  ## ${SVCNAME} ##" >> /etc/fstab || return 1
+    einfo "   adding tmpfs mount to /etc/fstab"
+    fstab_add_entry || { eend 1; return 1; }
 
     einfo "setup complete, please start service"
-
-    eend $?
+    eend 0
+    return 0
 }
 
 remove() {
     ebegin "Removing ${SVCNAME}"
 
-    if mountpoint ${portage} > /dev/null; then
-        umount -fl ${portage} > /dev/null || return 1
+    if is_mounted "${PORTAGE_ROOT}"; then
+        einfo "   unmounting ${PORTAGE_ROOT}"
+        if ! umount -fl -- "${PORTAGE_ROOT}" >/dev/null 2>&1; then
+            die "failed to unmount ${PORTAGE_ROOT}"
+            eend 1
+            return 1
+        fi
 
-        if mountpoint ${portage} > /dev/null ; then
-            eerror "   env not stable, ${portage} still mounted"
+        if is_mounted "${PORTAGE_ROOT}"; then
+            die "env not stable, ${PORTAGE_ROOT} still mounted"
+            eend 1
             return 1
         fi
     fi
 
-    if [ -f ${portage}/tmpfs-not-mounted ] ; then
-        rm ${portage}/tmpfs-not-mounted || return 1
+    if [ -f "${SENTINEL}" ]; then
+        rm -f -- "${SENTINEL}" || { eend 1; return 1; }
     fi
 
-    if grep "${portage}" /etc/fstab > /dev/null; then
-        sed -i "/## ${SVCNAME} ##/d" /etc/fstab || return 1
+    fstab_remove_entry || { eend 1; return 1; }
+
+    einfo "   purging ${PORTAGE_ROOT}"
+    safe_purge_dir "${PORTAGE_ROOT}" || { eend 1; return 1; }
+
+    restore || { eend 1; return 1; }
+
+    if [ -f "${TARBALL}" ]; then
+        rm -f -- "${TARBALL}" || { eend 1; return 1; }
     fi
 
-    einfo "   purging ${portage}"
-    rm -r ${portage} || return 1
-    mkdir ${portage} || return 1
-
-    restore || return 1
-
-    if [ -f ${tar} ] ; then
-        rm $tar || return 1
-    fi
-    
     einfo "complete"
-    eend $?
+    eend 0
+    return 0
 }
 
 start() {
     ebegin "Starting ${SVCNAME}"
-    if mountpoint ${portage} > /dev/null ; then
-        ewarn "   unmounting ${portage}"
-        umount -fl ${portage} > /dev/null || eerror "   failed"
+
+    if is_mounted "${PORTAGE_ROOT}"; then
+        ewarn "   ${PORTAGE_ROOT} is mounted; unmounting first"
+        if ! umount -fl -- "${PORTAGE_ROOT}" >/dev/null 2>&1; then
+            die "failed to unmount ${PORTAGE_ROOT}"
+            eend 1
+            return 1
+        fi
     fi
 
-    if [ ! -f ${portage}/tmpfs-not-mounted ] ; then
-        eerror "   please run setup first"
+    if [ ! -f "${SENTINEL}" ]; then
+        die "please run setup first (missing sentinel: ${SENTINEL})"
+        eend 1
         return 1
     fi
-    
-    mount ${portage} > /dev/null || eerror "   failed to mount ${portage}"
 
-    if [ ! -f ${portage}/gentoo/metadata/timestamp ] ; then
-        restore || eerror "   failed to restore ${tar}"
+    # mount(8) uses /etc/fstab entry we added
+    if ! mount -- "${PORTAGE_ROOT}" >/dev/null 2>&1; then
+        die "failed to mount ${PORTAGE_ROOT}"
+        eend 1
+        return 1
     fi
 
-    eend $?
+    # If tmpfs is empty, restore snapshot
+    if ! has_gentoo_repo_marker; then
+        restore || { eend 1; return 1; }
+    fi
+
+    eend 0
+    return 0
 }
 
 stop() {
     ebegin "Stopping ${SVCNAME}"
-  
-    if mountpoint ${portage} > /dev/null ; then
-        if [ -f ${portage}/gentoo/metadata/timestamp ] ; then
-            snapshot || eerror "   failed to archive current tmpfs contents"
+
+    if is_mounted "${PORTAGE_ROOT}"; then
+        if has_gentoo_repo_marker; then
+            snapshot || ewarn "   failed to archive current tmpfs contents"
         fi
-        umount -fl ${portage} > /dev/null || ewarn "   failed to umount tmpfs"
+
+        if ! umount -fl -- "${PORTAGE_ROOT}" >/dev/null 2>&1; then
+            ewarn "   failed to unmount tmpfs"
+            # do not hard-fail stop; report via eend
+            eend 1
+            return 1
+        fi
     else
-        ewarn "   openrc-run started state, ${portage} not mounted"
+        ewarn "   ${PORTAGE_ROOT} not mounted"
     fi
 
-    eend $?
+    eend 0
+    return 0
 }
-
