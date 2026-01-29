@@ -3,15 +3,16 @@
 # Populate a tmpfs-mounted Portage repo tree at /var/db/repos from a snapshot tarball.
 # Provides commands: setup remove snapshot (plus normal start/stop).
 
+description="Populate a tmpfs-mounted Portage repo tree from a snapshot tarball"
 extra_started_commands="snapshot"
 extra_stopped_commands="setup remove"
 
-PORTAGE_ROOT="/var/db/repos"
-TARBALL="/var/db/repos-snapshot.tar.gz"
-SENTINEL="${PORTAGE_ROOT}/tmpfs-not-mounted"
+readonly PORTAGE_ROOT="/var/db/repos"
+readonly TARBALL="/var/db/repos-snapshot.tar.gz"
+readonly SENTINEL="${PORTAGE_ROOT}/tmpfs-not-mounted"
 
 # Marker used to find/remove the exact fstab line this service owns
-FSTAB_MARK="## ${SVCNAME} ##"
+readonly FSTAB_MARK="## ${SVCNAME} ##"
 
 depend() {
     before nfs
@@ -32,7 +33,6 @@ is_mounted() {
     # Prefer mountpoint(1); otherwise fall back to /proc/mounts
     if have_cmd mountpoint; then
         mountpoint -q -- "$1"
-        return $?
     fi
 
     # POSIX-ish fallback
@@ -47,7 +47,7 @@ has_gentoo_repo_marker() {
 safe_purge_dir() {
     # Remove and recreate a directory safely.
     # Refuse to operate on empty, root, or non-absolute paths.
-    _d="$1"
+    local _d="$1"
 
     case "${_d}" in
         ""|"/")
@@ -145,6 +145,12 @@ snapshot() {
 restore() {
     if [ ! -f "${TARBALL}" ]; then
         die "snapshot tarball missing: ${TARBALL}"
+        return 1
+    fi
+
+    # Validate tarball before extracting: must contain expected paths only
+    if ! tar -tzf "${TARBALL}" 2>/dev/null | grep -q "^${PORTAGE_ROOT}"; then
+        die "tarball does not contain expected ${PORTAGE_ROOT} tree"
         return 1
     fi
 
