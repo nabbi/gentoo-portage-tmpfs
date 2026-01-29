@@ -4,6 +4,10 @@
 # Provides commands: setup remove snapshot (plus normal start/stop).
 
 description="Populate a tmpfs-mounted Portage repo tree from a snapshot tarball"
+description_snapshot="Archive the current repo tree to a compressed tarball"
+description_setup="Create snapshot, purge repo tree, add tmpfs fstab entry"
+description_remove="Unmount tmpfs, restore on-disk repo, remove fstab entry"
+
 extra_started_commands="snapshot"
 extra_stopped_commands="setup remove"
 
@@ -20,17 +24,20 @@ depend() {
 
 # -------- helpers --------
 
+# Print an error message and return failure.
 die() {
     eerror "   $*"
     return 1
 }
 
+# Return 0 if the given command exists in PATH.
 have_cmd() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Return 0 if the given path is an active mountpoint.
+# Prefer mountpoint(1); otherwise fall back to /proc/mounts.
 is_mounted() {
-    # Prefer mountpoint(1); otherwise fall back to /proc/mounts
     if have_cmd mountpoint; then
         mountpoint -q -- "$1"
     fi
@@ -40,13 +47,14 @@ is_mounted() {
     awk -v mp="$1" '$2 == mp { found=1 } END { exit(found ? 0 : 1) }' /proc/mounts 2>/dev/null
 }
 
+# Return 0 if the gentoo repo metadata timestamp file exists.
 has_gentoo_repo_marker() {
     [ -f "${PORTAGE_ROOT}/gentoo/metadata/timestamp" ]
 }
 
+# Remove and recreate a directory safely.
+# Refuse to operate on empty, root, non-absolute, or symlinked paths.
 safe_purge_dir() {
-    # Remove and recreate a directory safely.
-    # Refuse to operate on empty, root, or non-absolute paths.
     local _d="$1"
 
     case "${_d}" in
@@ -72,14 +80,14 @@ safe_purge_dir() {
     return 0
 }
 
+# Return 0 if /etc/fstab contains a line with our service marker.
 fstab_has_our_entry() {
-    # Only treat lines containing our marker as "owned"
     grep -F -- "${FSTAB_MARK}" /etc/fstab >/dev/null 2>&1
 }
 
+# Append a tmpfs fstab entry for PORTAGE_ROOT tagged with our marker.
+# No-op if the entry already exists.
 fstab_add_entry() {
-    # Add a single tmpfs mount entry for PORTAGE_ROOT, with our marker.
-    # Use a predictable format, avoid duplicate entries.
     if fstab_has_our_entry; then
         ewarn "   fstab already contains entry for ${SVCNAME}"
         return 0
@@ -89,6 +97,7 @@ fstab_add_entry() {
     return 0
 }
 
+# Delete any fstab line containing our service marker.
 fstab_remove_entry() {
     if ! fstab_has_our_entry; then
         return 0
@@ -99,8 +108,8 @@ fstab_remove_entry() {
     return 0
 }
 
+# Return 0 if the tarball exists and was modified within the last 24 hours.
 tarball_is_recent() {
-    # True if tarball modified within last 1440 minutes (24h)
     [ -f "${TARBALL}" ] || return 1
 
     # Use find -print -quit and check for any output
@@ -113,6 +122,8 @@ tarball_is_recent() {
 
 # -------- commands --------
 
+# Archive PORTAGE_ROOT into a gzipped tarball with absolute paths.
+# Skips creation if a recent (<24h) tarball already exists.
 snapshot() {
     if tarball_is_recent; then
         einfo "   skipping snapshot creation, recent archive exists"
@@ -142,6 +153,7 @@ snapshot() {
     return 0
 }
 
+# Validate and extract the snapshot tarball back to its original absolute paths.
 restore() {
     if [ ! -f "${TARBALL}" ]; then
         die "snapshot tarball missing: ${TARBALL}"
@@ -165,6 +177,8 @@ restore() {
     return 0
 }
 
+# First-run deployment: snapshot the on-disk repo, purge PORTAGE_ROOT,
+# place a sentinel file, and add a tmpfs fstab entry.
 setup() {
     ebegin "Deploying ${SVCNAME}"
 
@@ -208,6 +222,8 @@ setup() {
     return 0
 }
 
+# Tear down: unmount tmpfs, remove sentinel and fstab entry,
+# restore the on-disk repo from tarball, then delete the tarball.
 remove() {
     ebegin "Removing ${SVCNAME}"
 
@@ -246,6 +262,7 @@ remove() {
     return 0
 }
 
+# Mount the tmpfs at PORTAGE_ROOT and restore the snapshot if empty.
 start() {
     ebegin "Starting ${SVCNAME}"
 
@@ -280,6 +297,7 @@ start() {
     return 0
 }
 
+# Snapshot the live repo tree and unmount the tmpfs.
 stop() {
     ebegin "Stopping ${SVCNAME}"
 
